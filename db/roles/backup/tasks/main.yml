@@ -58,6 +58,15 @@
   register: patroni_config_updated
   failed_when: "'Error' in patroni_config_updated.stderr"
 
+- name: 2-2-1. DB 내부 복제 계정 비번을 SCRAM 방식으로 강제 갱신
+  become: yes
+  become_user: postgres
+  shell: |
+    psql -c "SET password_encryption = 'scram-sha-256'; ALTER USER {{ patroni_replication_user }} WITH PASSWORD '{{ patroni_replication_password }}';"
+  delegate_to: db-a
+  run_once: true
+  when: patroni_config_updated.changed
+
 - name: 2-3. 임시 파일 삭제
   file:
     path: /tmp/patroni_config_update.yml
