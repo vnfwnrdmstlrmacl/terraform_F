@@ -1,0 +1,122 @@
+---
+##########################################################
+# 1. 패키지 및 환경 준비 (모든 노드 공통)
+##########################################################
+- name: (RedHat 계열) EPEL 및 PostgreSQL 저장소 설치
+  dnf:
+    name: 
+      - https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+      - "https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
+    state: present
+    disable_gpg_check: yes
+  when: ansible_os_family == "RedHat"
+
+- name: 1. 필수 의존성 패키지 설치 (pgBackRest, jq, curl, acl)
+  package:
+    name: [pgbackrest, jq, curl, acl]
+    state: present
+
+- name: 5. pgBackRest 디렉토리 생성 및 권한 설정 (미리 해둬야 db-s가 안 죽음)
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0750'
+  with_items:
+    - "{{ pgbackrest_log_path | default('/var/log/pgbackrest') }}"
+    - "/etc/pgbackrest"
+
+- name: 6. pgbackrest.conf 템플릿 배포 (경로 변수 반영됨)
+  template:
+    src: pgbackrest.conf.j2
+    dest: /etc/pgbackrest.conf
+    owner: postgres
+    group: postgres
+    mode: '0640'
+
+##########################################################
+# 2. Patroni DCS 설정 업데이트
+##########################################################
+- name: 2-1. Patroni용 임시 설정 파일 생성
+  copy:
+    dest: /tmp/patroni_config_update.yml
+    content: |
+      postgresql:
+        parameters:
+          wal_level: logical
+          archive_mode: "on"
+          archive_command: "pgbackrest --stanza={{ pgbackrest_stanza_name }} archive-push %p"
+          max_wal_senders: 10
+          max_replication_slots: 10
+          hot_standby: "on"
+
+- name: 2-2. Patroni DCS 설정 업데이트
+  shell: "patronictl -c /etc/patroni.yml edit-config --force --apply /tmp/patroni_config_update.yml {{ cluster_name | default('pg-ha') }}"
+  become: yes
+  become_user: root
+  register: patroni_config_updated
+  failed_when: "'Error' in patroni_config_updated.stderr"
+
+- name: 2-3. 임시 파일 삭제
+  file:
+    path: /tmp/patroni_config_update.yml
+    state: absent
+
+- name: 3. Patroni 클러스터 재시작 (순차적 재시작)
+  shell: "echo -e '\ny\n' | patronictl -c /etc/patroni.yml restart {{ cluster_name | default('pg-ha') }}"
+  become: yes
+  become_user: root
+  when: patroni_config_updated.changed
+  register: patroni_restart_result
+
+- name: 4. DB 기동 대기
+  pause:
+    seconds: 15
+  when: patroni_restart_result.changed
+
+##########################################################
+# 3. pgBackRest Stanza 생성 및 검증 (무조건 db-a에서만!)
+##########################################################
+- name: 7. pgBackRest Stanza 생성 (Leader인 db-a로 위임)
+  become: yes
+  become_user: postgres
+  shell: "pgbackrest --stanza={{ pgbackrest_stanza_name }} stanza-create --log-level-console=info"
+  register: stanza_create_result
+  delegate_to: db-a
+  run_once: true
+  failed_when: 
+    - stanza_create_result.rc != 0 
+    - "'already exists' not in stanza_create_result.stderr"
+
+- name: 7-1. pgBackRest 설정 검증 (Leader인 db-a에서)
+  become: yes
+  become_user: postgres
+  shell: "pgbackrest --stanza={{ pgbackrest_stanza_name }} check"
+  delegate_to: db-a
+  run_once: true
+
+- name: 8. 최초 1회 Full Backup 수행 (Leader에서)
+  become: yes
+  become_user: postgres
+  command: "pgbackrest --stanza={{ pgbackrest_stanza_name }} --type=full backup"
+  async: 3600
+  poll: 30
+  delegate_to: db-a
+  run_once: true
+
+##########################################################
+# 4. 백업 스케줄링
+##########################################################
+- name: 9. 백업 자동화 스케줄 등록 (Crontab)
+  cron:
+    name: "{{ item.name }}"
+    user: "postgres"
+    job: "{{ item.job }} >> {{ pgbackrest_log_path | default('/var/log/pgbackrest') }}/backup-cron.log 2>&1"
+    minute: "{{ item.minute }}"
+    hour: "{{ item.hour }}"
+    weekday: "{{ item.weekday | default('*') }}"
+  with_items:
+    - { name: "Weekly Full Backup", job: "pgbackrest --stanza={{ pgbackrest_stanza_name }} --type=full backup", minute: "0", hour: "0", weekday: "0" }
+    - { name: "Daily Differential Backup", job: "pgbackrest --stanza={{ pgbackrest_stanza_name }} --type=diff backup", minute: "0", hour: "0", weekday: "1-6" }
+    - { name: "Hourly Incremental Backup", job: "pgbackrest --stanza={{ pgbackrest_stanza_name }} --type=incr backup", minute: "30", hour: "*", weekday: "*" }
